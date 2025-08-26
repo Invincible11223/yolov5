@@ -72,8 +72,6 @@ def autopad(k, p=None, d=1):
         p = k // 2 if isinstance(k, int) else [x // 2 for x in k]  # auto-pad
     return p
 
-
-﻿
 class WinogradConv2D(nn.Module):
     """
     F(2×2,3×3) Winograd convolution tile:
@@ -179,8 +177,6 @@ class WinogradConv2D(nn.Module):
     def fuse(self):
         return self
 
-
-  
 class Conv(nn.Module):
     """Applies a convolution, batch normalization, and activation function to an input tensor in a neural network."""
 
