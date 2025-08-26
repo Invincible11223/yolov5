@@ -175,7 +175,7 @@ class WinogradConv2D(nn.Module):
         return self.forward(x)
 
     def fuse(self):
-        if isinstance(self.conv, WinogradConv2D) and WINOGRAD_ENABLED;
+        if isinstance(self.conv, WinogradConv2D) and WINOGRAD_ENABLED:
             return self
 
         self.conv = fuse_conv_and_bn(self.conv, self.bn)
