@@ -37,7 +37,7 @@ except (ImportError, AssertionError):
     import ultralytics
 
 from ultralytics.utils.plotting import Annotator, colors, save_one_box
-from utils.torch_utils import copy_attr, smart_inference_mode, fuse_conv_and_bn
+
 from utils import TryExcept
 from utils.dataloaders import exif_transpose, letterbox
 from utils.general import (
@@ -57,7 +57,7 @@ from utils.general import (
     xyxy2xywh,
     yaml_load,
 )
-from utils.torch_utils import copy_attr, smart_inference_mode
+from utils.torch_utils import copy_attr, smart_inference_mode, fuse_conv_and_bn
 
 
 def autopad(k, p=None, d=1):
@@ -175,12 +175,6 @@ class WinogradConv2D(nn.Module):
         return self.forward(x)
 
     def fuse(self):
-        if isinstance(self.conv, WinogradConv2D) and WINOGRAD_ENABLED:
-            return self
-
-        self.conv = fuse_conv_and_bn(self.conv, self.bn)
-        self.bn = nn.Identity()
-        self.forward = self.forward_fuse
         return self
 
 class Conv(nn.Module):
@@ -202,7 +196,16 @@ class Conv(nn.Module):
             self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
         self.bn = nn.BatchNorm2d(c2)
         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+    
+    def fuse(self):
+        if isinstance(self.conv, WinogradConv2D) and WINOGRAD_ENABLED:
+            return self
 
+        self.conv = fuse_conv_and_bn(self.conv, self.bn)
+        self.bn = nn.Identity()
+        self.forward = self.forward_fuse
+        return self
+    
     def forward(self, x):
         """Applies a convolution followed by batch normalization and an activation function to the input tensor `x`."""
         return self.act(self.bn(self.conv(x)))
