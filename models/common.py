@@ -22,6 +22,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from torch.cuda import amp
+import os
+WINOGRAD_ENABLED = os.getenv("YOLO_WINOGRAD_DISABLE", "0") != "1"
 
 # Import 'ultralytics' package or install if missing
 try:
@@ -29,7 +31,7 @@ try:
 
     assert hasattr(ultralytics, "__version__")  # verify package is not directory
 except (ImportError, AssertionError):
-    import os
+    
 
     os.system("pip install -U ultralytics")
     import ultralytics
@@ -71,25 +73,17 @@ def autopad(k, p=None, d=1):
     return p
 
 
+﻿
 class WinogradConv2D(nn.Module):
     """
     F(2×2,3×3) Winograd convolution tile:
-      - Accepts same args as nn.Conv2d(in_ch, out_ch, k, s, p, bias)
-      - Internally only supports k=3, s=1, groups=1.
-      - Transforms 4×4 input tiles → 2×2 output tiles.
+    - Supports only k=3, stride=1, groups=1.
+    - Produces 2×2 output tiles from 4×4 input tiles.
     """
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 kernel_size=3,
-                 stride=1,
-                 padding=1,
-                 bias=True):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False):
         super().__init__()
-        # only support 3×3 / stride=1 / no groups
         assert kernel_size == 3, "WinogradConv2D: kernel_size must be 3"
         assert stride == 1,      "WinogradConv2D: stride must be 1"
-        # store parameters
         self.in_channels  = in_channels
         self.out_channels = out_channels
         self.padding      = padding
@@ -98,14 +92,11 @@ class WinogradConv2D(nn.Module):
         self.dilation     = (1, 1)
         self.groups       = 1
 
+        # Learnable weights/bias in the spatial domain
+        self.weight = nn.Parameter(torch.randn(out_channels, in_channels, 3, 3))
+        self.bias   = nn.Parameter(torch.zeros(out_channels)) if bias else None
 
-        # learnable weight & bias
-        self.weight = nn.Parameter(torch.randn(out_channels,
-                                               in_channels, 3, 3))
-        self.bias   = nn.Parameter(torch.zeros(out_channels)) \
-                          if bias else None
-
-        # Winograd transform mats (F(2,3))
+        # Winograd transform matrices (float32 buffers; we’ll cast each forward)
         Bt = torch.tensor([
             [ 1,  0, -1,  0],
             [ 0,  1,  1,  0],
@@ -122,67 +113,64 @@ class WinogradConv2D(nn.Module):
             [ 1,  1,  1,  0],
             [ 0,  1, -1, -1]
         ], dtype=torch.float32)
-
-        # register so they move with model to GPU/CPU
-        self.register_buffer('Bt', Bt)
-        self.register_buffer('G',  G)
-        self.register_buffer('At', At)
+        self.register_buffer("Bt", Bt)
+        self.register_buffer("G",  G)
+        self.register_buffer("At", At)
 
     def forward(self, x):
         B, C, H, W = x.shape
         assert C == self.in_channels
 
-        # 1) pad with standard conv padding first
-        x = F.pad(x,
-                  (self.padding, self.padding,
-                   self.padding, self.padding))
-        H_p, W_p = x.shape[2:]
+        # Cast buffers to input dtype/device to avoid implicit casts
+        Bt = self.Bt.to(dtype=x.dtype, device=x.device)
+        G  = self.G .to(dtype=x.dtype, device=x.device)
+        At = self.At.to(dtype=x.dtype, device=x.device)
 
-        H_out, W_out = H, W
-        # 1.1) ensure H_p and W_p are divisible by 2 (Winograd requires even dims)
-        extra_h = H_p % 2
-        extra_w = W_p % 2
-        if extra_h != 0 or extra_w != 0:
-            x = F.pad(x, (0, extra_w, 0, extra_h))  # pad right and bottom as needed
+        # Single-shot padding: pad by 'padding', then add one more pad on right/bottom if needed (even size)
+        Hp = H + 2 * self.padding
+        Wp = W + 2 * self.padding
+        pad_r = Wp % 2  # 0 or 1
+        pad_b = Hp % 2  # 0 or 1
+        x = F.pad(x, (self.padding, self.padding + pad_r,
+                      self.padding, self.padding + pad_b))
 
-        # update padded sizes after potential extra pad
-        H_p, W_p = x.shape[2:]
-
-
-        # 2) make 4×4 tiles with stride=2 → shape [B, C, nH, nW, 4, 4]
-        tiles = x.unfold(2, 4, 2).unfold(3, 4, 2)
+        # Create 4×4 tiles stepping by 2 → [B, C, nH, nW, 4, 4]
+        # Ensure contiguity before unfold (safety)
+        x = x.contiguous()
+        tiles = x.unfold(2, 4, 2).unfold(3, 4, 2)  # shape: B,C,nH,nW,4,4
         B, C, nH, nW, _, _ = tiles.shape
 
-        # 3) transform kernel: U[o,c,i,j] = Σₚₑ G[i,p]·W[o,c,p,q]·G[j,q]
-        tmp1 = torch.einsum('ip,ocpq->ociq', self.G, self.weight)   # [O,C,4,3]
-        U    = torch.einsum('jq,ociq->ocij', self.G, tmp1)          # [O,C,4,4]
+        # Optional: keep transforms/accumulation in fp32 if running in fp16 for better accuracy
+        # Uncomment this block if you see accuracy drift under AMP.
+        # if x.dtype == torch.float16:
+        #     tiles32 = tiles.float()
+        #     G32, Bt32, At32 = G.float(), Bt.float(), At.float()
+        # else:
+        #     tiles32, G32, Bt32, At32 = tiles, G, Bt, At
 
-        # 4) transform input tiles: V[b,c,h,w,i,j] = Σᵣₛ Bt[i,r]·tiles[b,c,h,w,r,s]·Bt[j,s]
-        t2 = torch.einsum('ij,bcnhjk->bcnhik', self.Bt,   tiles)    # [B,C,nH,nW,4,4]
-        V  = torch.einsum('kl,bcnhik->bcnhil', self.Bt.T, t2)       # [B,C,nH,nW,4,4]
+        # 1) Transform kernel: U[o,c,i,j] = Σ G[i,p] * W[o,c,p,q] * G[j,q]
+        tmp1 = torch.einsum("ip,ocpq->ociq", G, self.weight)
+        U    = torch.einsum("jq,ociq->ocij", G, tmp1)  # [O,C,4,4]
 
-        # 5) broadcast-multiply & sum over channels:  (V·U).sum(C)
-        V_exp = V.unsqueeze(1)                                     # [B,1,C,nH,nW,4,4]
-        U_exp = U.view(1,                   # [1,O,C,1,1,4,4]
-                     self.out_channels,
-                     self.in_channels, 1, 1, 4, 4)
-        M     = (V_exp * U_exp).sum(2)                             # [B,O,nH,nW,4,4]
+        # 2) Transform input tiles: V[b,c,h,w,i,j] = Σ Bt[i,r] * tiles[b,c,h,w,r,s] * Bt[j,s]
+        t2 = torch.einsum("ir,bcnhrs->bcnhis", Bt, tiles)         # [B,C,nH,nW,4,4]
+        V  = torch.einsum("js,bcnhis->bcnhij", Bt.transpose(0,1), t2)  # [B,C,nH,nW,4,4]
 
-        # 6) inverse Winograd: Yt[b,o,h,w,r,s] = Σᵢⱼ At[r,i]·M[b,o,h,w,i,j]·At[s,j]
-        t3 = torch.einsum('ri,bohnij->borhnj',    self.At,    M)   # [B,O,nH,nW,2,4]
-        Yt = torch.einsum('js,borhnj->borhns',    self.At.T, t3)   # [B,O,nH,nW,2,2]
+        # 3) Elementwise multiply and sum over input channels
+        V_exp = V.unsqueeze(1)  # [B,1,C,nH,nW,4,4]
+        U_exp = U.view(1, self.out_channels, self.in_channels, 1, 1, 4, 4)
+        M     = (V_exp * U_exp).sum(2)  # [B,O,nH,nW,4,4]
 
-        # 7) re-assemble tiles → [B,O,nH*2,nW*2]
-        Y = Yt.permute(0,1,2,4,3,5).contiguous() \
-             .view(B, self.out_channels, nH*2, nW*2)
+        # 4) Inverse transform to 2×2 tiles
+        t3 = torch.einsum("ri,bohnij->borhnj", At, M)              # [B,O,nH,nW,2,4]
+        Yt = torch.einsum("js,borhnj->borhns", At.transpose(0,1), t3)  # [B,O,nH,nW,2,2]
 
-        # 8) crop to original spatial dims and add bias
-        Y = Y[:, :, :H, :W]  # Directly crop to match input H, W
+        # 5) Stitch tiles → [B,O,nH*2,nW*2] and crop back to H×W
+        Y = Yt.permute(0,1,2,4,3,5).contiguous().view(B, self.out_channels, nH*2, nW*2)
+        Y = Y[:, :, :H, :W]
 
         if self.bias is not None:
             Y = Y + self.bias.view(1, -1, 1, 1)
-
-
         return Y
 
     def fuseforward(self, x):
@@ -191,6 +179,8 @@ class WinogradConv2D(nn.Module):
     def fuse(self):
         return self
 
+
+  
 class Conv(nn.Module):
     """Applies a convolution, batch normalization, and activation function to an input tensor in a neural network."""
 
@@ -199,9 +189,14 @@ class Conv(nn.Module):
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
         """Initializes a standard convolution layer with optional batch normalization and activation."""
         super().__init__()
-        if k == 3 and s == 1 and g == 1:
-            self.conv = WinogradConv2D(c1, c2, kernel_size=k, stride=s, padding=autopad(k, p), bias=False)
+        if (WINOGRAD_ENABLED
+            and isinstance(k, int) and k == 3
+            and isinstance(s, int) and s == 1
+            and g == 1 and d == 1):
+            # Winograd path for standard 3×3 stride-1
+            self.conv = WinogradConv2D(c1, c2, kernel_size=3, stride=1, padding=autopad(k, p), bias=False)
         else:
+            # Fallback to standard conv (depthwise, stride≠1, dilation, groups, etc.)
             self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
         self.bn = nn.BatchNorm2d(c2)
         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
