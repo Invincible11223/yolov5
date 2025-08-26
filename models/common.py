@@ -37,7 +37,7 @@ except (ImportError, AssertionError):
     import ultralytics
 
 from ultralytics.utils.plotting import Annotator, colors, save_one_box
-
+from utils.torch_utils import copy_attr, smart_inference_mode, fuse_conv_and_bn
 from utils import TryExcept
 from utils.dataloaders import exif_transpose, letterbox
 from utils.general import (
@@ -175,6 +175,12 @@ class WinogradConv2D(nn.Module):
         return self.forward(x)
 
     def fuse(self):
+        if isinstance(self.conv, WinogradConv2D) and WINOGRAD_ENABLED;
+            return self
+
+        self.conv = fuse_conv_and_bn(self.conv, self.bn)
+        self.bn = nn.Identity()
+        self.forward = self.forward_fuse
         return self
 
 class Conv(nn.Module):
